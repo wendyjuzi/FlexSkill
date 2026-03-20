@@ -3,8 +3,11 @@ import os
 import sys
 import json
 import gc
+import uuid
+import logging
 from datetime import datetime
 import numpy as np
+import torch
 from vllm import LLM, SamplingParams
 from jinja2 import Template
 from typing import List
@@ -21,6 +24,18 @@ from .experience import (
 from .toolrag import ToolRAGModel
 
 from .utils import NoRepeatSentenceProcessor, ReasoningTraceChecker, tool_result_format
+
+try:
+    from .optimization import (
+        TxAgentOptimizationPlugin,
+        FailureContext as OptimizationFailureContext,
+    )
+except ImportError:
+    TxAgentOptimizationPlugin = None
+    OptimizationFailureContext = None
+
+
+logger = logging.getLogger(__name__)
 
 
 class TxAgent:
@@ -47,6 +62,11 @@ class TxAgent:
                  experience_top_k=2,
                  skill_generator_use_llm=False,
                  skill_generator_max_new_tokens=256,
+                 enable_optimization=True,
+                 optimization_auto_apply=True,
+                 optimization_failure_store_path="data/optimization_failures.jsonl",
+                 optimization_cache_size=1000,
+                 optimization_cache_ttl=3600,
                  ):
         self.model_name = model_name
         self.tokenizer = None
@@ -82,7 +102,16 @@ class TxAgent:
         self.failure_memory = None
         self.skill_bank = None
         self.skill_generator = None
+        self.enable_optimization = enable_optimization
+        self.optimization_auto_apply = optimization_auto_apply
+        self.optimization_failure_store_path = optimization_failure_store_path
+        self.optimization_cache_size = optimization_cache_size
+        self.optimization_cache_ttl = optimization_cache_ttl
+        self.optimization_plugin = None
+        self.optimization_session_id = None
+        self.last_prompt_token_count = 0
         self.init_experience_modules()
+        self.init_optimization_modules()
         self.print_self_values()
 
     def init_experience_modules(self):
@@ -100,6 +129,76 @@ class TxAgent:
             max_new_tokens=self.skill_generator_max_new_tokens,
             max_token=8192,
         )
+
+    def init_optimization_modules(self):
+        if not self.enable_optimization:
+            return
+        if TxAgentOptimizationPlugin is None or OptimizationFailureContext is None:
+            print("Optimization module import failed, optimization is disabled.")
+            self.enable_optimization = False
+            return
+        self.optimization_plugin = TxAgentOptimizationPlugin(
+            failure_store_path=self.optimization_failure_store_path,
+            cache_size=self.optimization_cache_size,
+            cache_ttl=self.optimization_cache_ttl,
+        )
+        self.optimization_plugin.auto_apply = self.optimization_auto_apply
+        self.optimization_plugin.on_register(self)
+
+    def _build_optimization_context(
+        self,
+        reasoning_step=0,
+        tool_name=None,
+        tool_parameters=None,
+        temperature=None,
+        max_tokens=None,
+        token_usage=None,
+    ):
+        if not self.enable_optimization or OptimizationFailureContext is None:
+            return None
+        context_kwargs = {
+            "reasoning_step": max(int(reasoning_step), 0),
+            "reasoning_depth": max(int(reasoning_step) - 1, 0),
+            "tool_name": tool_name,
+            "tool_parameters": tool_parameters or {},
+            "rag_top_k": self.step_rag_num,
+            "rag_extra_factor": 30.0,
+        }
+        if temperature is not None:
+            context_kwargs["model_temperature"] = float(temperature)
+        if max_tokens is not None:
+            context_kwargs["model_max_tokens"] = int(max_tokens)
+        if token_usage is not None:
+            context_kwargs["token_usage"] = int(token_usage)
+        return OptimizationFailureContext(**context_kwargs)
+
+    def _trigger_optimization_event(self, event_name, context):
+        if not self.enable_optimization or self.optimization_plugin is None:
+            return
+        handler = getattr(self.optimization_plugin, event_name, None)
+        if handler is None:
+            return
+        try:
+            handler(context)
+        except Exception as e:
+            print(f"Optimization event {event_name} failed: {e}")
+
+    def _start_optimization_session(self, task_message):
+        if not self.enable_optimization:
+            return
+        self.optimization_session_id = f"session_{uuid.uuid4().hex[:12]}"
+        self._trigger_optimization_event("on_session_start", {
+            "session_id": self.optimization_session_id,
+            "task_id": task_message[:200],
+        })
+
+    def _end_optimization_session(self):
+        if not self.enable_optimization or self.optimization_session_id is None:
+            return
+        self._trigger_optimization_event("on_session_end", {
+            "session_id": self.optimization_session_id,
+        })
+        self.optimization_session_id = None
 
     def init_model(self):
         self.load_models()
@@ -298,7 +397,9 @@ class TxAgent:
                           message_for_call_agent=None,
                           call_agent=False,
                           call_agent_level=None,
-                          temperature=None):
+                          temperature=None,
+                          reasoning_step=0,
+                          max_token=None):
 
         function_call_json, message = self.tooluniverse.extract_function_call_json(
             fcall_str, return_message=return_message, verbose=False)
@@ -308,6 +409,21 @@ class TxAgent:
             if isinstance(function_call_json, list):
                 for i in range(len(function_call_json)):
                     print("\033[94mTool Call:\033[0m", function_call_json[i])
+                    tool_name = function_call_json[i].get("name")
+                    tool_params = function_call_json[i].get("arguments", {})
+                    failure_context = self._build_optimization_context(
+                        reasoning_step=reasoning_step,
+                        tool_name=tool_name,
+                        tool_parameters=tool_params,
+                        temperature=temperature,
+                        max_tokens=max_token,
+                        token_usage=self.last_prompt_token_count,
+                    )
+                    self._trigger_optimization_event("on_tool_execution_start", {
+                        "tool_name": tool_name,
+                        "tool_parameters": tool_params,
+                        "failure_context": failure_context,
+                    })
                     if function_call_json[i]["name"] == 'Finish':
                         special_tool_call = 'Finish'
                         break
@@ -357,6 +473,18 @@ class TxAgent:
                             outcome=str(call_result),
                             metadata={"source": "run_function_call"},
                         )
+                        self._trigger_optimization_event("on_tool_execution_failed", {
+                            "tool_name": tool_name,
+                            "tool_parameters": tool_params,
+                            "error_message": str(call_result),
+                            "failure_context": failure_context,
+                        })
+                    else:
+                        self._trigger_optimization_event("on_tool_execution_success", {
+                            "tool_name": tool_name,
+                            "tool_parameters": tool_params,
+                            "failure_context": failure_context,
+                        })
 
                     call_id = self.tooluniverse.call_id_gen()
                     function_call_json[i]["call_id"] = call_id
@@ -374,6 +502,18 @@ class TxAgent:
                 outcome="The agent produced an invalid function call.",
                 metadata={"source": "run_function_call"},
             )
+            self._trigger_optimization_event("on_tool_execution_failed", {
+                "tool_name": "invalid_function_call",
+                "tool_parameters": {},
+                "error_message": "Not a valid function call format.",
+                "failure_context": self._build_optimization_context(
+                    reasoning_step=reasoning_step,
+                    tool_name="invalid_function_call",
+                    temperature=temperature,
+                    max_tokens=max_token,
+                    token_usage=self.last_prompt_token_count,
+                ),
+            })
             call_results.append({
                 "role": "tool",
                 "content": json.dumps({"content": "Not a valid function call, please check the function call format."})
@@ -395,6 +535,8 @@ class TxAgent:
                                  call_agent=False,
                                  call_agent_level=None,
                                  temperature=None,
+                                 reasoning_step=0,
+                                 max_token=None,
                                  return_gradio_history=True):
 
         function_call_json, message = self.tooluniverse.extract_function_call_json(
@@ -406,6 +548,21 @@ class TxAgent:
         if function_call_json is not None:
             if isinstance(function_call_json, list):
                 for i in range(len(function_call_json)):
+                    tool_name = function_call_json[i].get("name")
+                    tool_params = function_call_json[i].get("arguments", {})
+                    failure_context = self._build_optimization_context(
+                        reasoning_step=reasoning_step,
+                        tool_name=tool_name,
+                        tool_parameters=tool_params,
+                        temperature=temperature,
+                        max_tokens=max_token,
+                        token_usage=self.last_prompt_token_count,
+                    )
+                    self._trigger_optimization_event("on_tool_execution_start", {
+                        "tool_name": tool_name,
+                        "tool_parameters": tool_params,
+                        "failure_context": failure_context,
+                    })
                     if function_call_json[i]["name"] == 'Finish':
                         special_tool_call = 'Finish'
                         break
@@ -448,6 +605,20 @@ class TxAgent:
                         call_result = self.tooluniverse.run_one_function(
                             function_call_json[i])
 
+                    if self.detect_failure_result(call_result):
+                        self._trigger_optimization_event("on_tool_execution_failed", {
+                            "tool_name": tool_name,
+                            "tool_parameters": tool_params,
+                            "error_message": str(call_result),
+                            "failure_context": failure_context,
+                        })
+                    else:
+                        self._trigger_optimization_event("on_tool_execution_success", {
+                            "tool_name": tool_name,
+                            "tool_parameters": tool_params,
+                            "failure_context": failure_context,
+                        })
+
                     call_id = self.tooluniverse.call_id_gen()
                     function_call_json[i]["call_id"] = call_id
                     call_results.append({
@@ -471,6 +642,18 @@ class TxAgent:
                 outcome="The agent produced an invalid function call.",
                 metadata={"source": "run_function_call_stream"},
             )
+            self._trigger_optimization_event("on_tool_execution_failed", {
+                "tool_name": "invalid_function_call",
+                "tool_parameters": {},
+                "error_message": "Not a valid function call format.",
+                "failure_context": self._build_optimization_context(
+                    reasoning_step=reasoning_step,
+                    tool_name="invalid_function_call",
+                    temperature=temperature,
+                    max_tokens=max_token,
+                    token_usage=self.last_prompt_token_count,
+                ),
+            })
             call_results.append({
                 "role": "tool",
                 "content": json.dumps({"content": "Not a valid function call, please check the function call format."})
@@ -539,6 +722,7 @@ class TxAgent:
         if self.enable_checker:
             checker = ReasoningTraceChecker(message, conversation)
         try:
+            self._start_optimization_session(message)
             while next_round and current_round < max_round:
                 current_round += 1
                 if len(outputs) > 0:
@@ -548,7 +732,9 @@ class TxAgent:
                         message_for_call_agent=message,
                         call_agent=call_agent,
                         call_agent_level=call_agent_level,
-                        temperature=temperature)
+                        temperature=temperature,
+                        reasoning_step=current_round,
+                        max_token=max_token)
 
                     if special_tool_call == 'Finish':
                         next_round = False
@@ -581,6 +767,15 @@ class TxAgent:
                         next_round = False
                         print(
                             "Internal error in reasoning: " + wrong_info)
+                        self._trigger_optimization_event("on_reasoning_failure", {
+                            "error_message": wrong_info,
+                            "failure_context": self._build_optimization_context(
+                                reasoning_step=current_round,
+                                temperature=temperature,
+                                max_tokens=max_token,
+                                token_usage=self.last_prompt_token_count,
+                            ),
+                        })
                         self.log_failure_event(
                             state=message,
                             action="reasoning_trace",
@@ -602,10 +797,29 @@ class TxAgent:
                     next_round = False
                     print(
                         "The number of tokens exceeds the maximum limit.")
+                    self._trigger_optimization_event("on_token_overflow", {
+                        "current_tokens": self.last_prompt_token_count,
+                        "max_tokens": max_token if max_token is not None else 0,
+                        "failure_context": self._build_optimization_context(
+                            reasoning_step=current_round,
+                            temperature=temperature,
+                            max_tokens=max_token,
+                            token_usage=self.last_prompt_token_count,
+                        ),
+                    })
                 else:
                     last_outputs.append(last_outputs_str)
             if max_round == current_round:
                 print("The number of rounds exceeds the maximum limit!")
+                self._trigger_optimization_event("on_loop_detected", {
+                    "tool_sequence": [],
+                    "failure_context": self._build_optimization_context(
+                        reasoning_step=current_round,
+                        temperature=temperature,
+                        max_tokens=max_token,
+                        token_usage=self.last_prompt_token_count,
+                    ),
+                })
                 self.log_failure_event(
                     state=message,
                     action="max_round",
@@ -621,6 +835,15 @@ class TxAgent:
 
         except Exception as e:
             print(f"Error: {e}")
+            self._trigger_optimization_event("on_exception", {
+                "exception": e,
+                "failure_context": self._build_optimization_context(
+                    reasoning_step=current_round,
+                    temperature=temperature,
+                    max_tokens=max_token,
+                    token_usage=self.last_prompt_token_count,
+                ),
+            })
             self.log_failure_event(
                 state=message,
                 action="exception",
@@ -633,6 +856,8 @@ class TxAgent:
                 return self.get_answer_based_on_unfinished_reasoning(conversation, temperature, max_new_tokens, max_token)
             else:
                 return None
+        finally:
+            self._end_optimization_session()
 
     def build_logits_processor(self, messages, llm):
         # Use the tokenizer from the LLM instance.
@@ -675,6 +900,7 @@ class TxAgent:
             token_overflow = False
             num_input_tokens = len(self.tokenizer.encode(
                 prompt, return_tensors="pt")[0])
+            self.last_prompt_token_count = num_input_tokens
             if max_token is not None:
                 if num_input_tokens > max_token:
                     torch.cuda.empty_cache()
@@ -966,6 +1192,7 @@ Generate **one summarized sentence** about "function calls' responses" with nece
                 message, conversation, init_index=len(conversation))
 
         try:
+            self._start_optimization_session(message)
             while next_round and current_round < max_round:
                 current_round += 1
                 if len(last_outputs) > 0:
@@ -975,7 +1202,9 @@ Generate **one summarized sentence** about "function calls' responses" with nece
                         message_for_call_agent=message,
                         call_agent=call_agent,
                         call_agent_level=call_agent_level,
-                        temperature=temperature)
+                        temperature=temperature,
+                        reasoning_step=current_round,
+                        max_token=max_token)
                     history.extend(current_gradio_history)
                     if special_tool_call == 'Finish':
                         yield history
@@ -1011,6 +1240,15 @@ Generate **one summarized sentence** about "function calls' responses" with nece
                     if not good_status:
                         next_round = False
                         print("Internal error in reasoning: " + wrong_info)
+                        self._trigger_optimization_event("on_reasoning_failure", {
+                            "error_message": wrong_info,
+                            "failure_context": self._build_optimization_context(
+                                reasoning_step=current_round,
+                                temperature=temperature,
+                                max_tokens=max_token,
+                                token_usage=self.last_prompt_token_count,
+                            ),
+                        })
                         self.log_failure_event(
                             state=message,
                             action="reasoning_trace",
@@ -1053,6 +1291,17 @@ Generate **one summarized sentence** about "function calls' responses" with nece
                     yield history
 
                 last_outputs.append(last_outputs_str)
+                if token_overflow:
+                    self._trigger_optimization_event("on_token_overflow", {
+                        "current_tokens": self.last_prompt_token_count,
+                        "max_tokens": max_token if max_token is not None else 0,
+                        "failure_context": self._build_optimization_context(
+                            reasoning_step=current_round,
+                            temperature=temperature,
+                            max_tokens=max_token,
+                            token_usage=self.last_prompt_token_count,
+                        ),
+                    })
 
             if self.force_finish:
                 last_outputs_str = self.get_answer_based_on_unfinished_reasoning(
@@ -1074,6 +1323,15 @@ Generate **one summarized sentence** about "function calls' responses" with nece
                 yield history
             else:
                 yield "The number of rounds exceeds the maximum limit!"
+                self._trigger_optimization_event("on_loop_detected", {
+                    "tool_sequence": [],
+                    "failure_context": self._build_optimization_context(
+                        reasoning_step=current_round,
+                        temperature=temperature,
+                        max_tokens=max_token,
+                        token_usage=self.last_prompt_token_count,
+                    ),
+                })
                 self.log_failure_event(
                     state=message,
                     action="max_round",
@@ -1085,6 +1343,15 @@ Generate **one summarized sentence** about "function calls' responses" with nece
 
         except Exception as e:
             print(f"Error: {e}")
+            self._trigger_optimization_event("on_exception", {
+                "exception": e,
+                "failure_context": self._build_optimization_context(
+                    reasoning_step=current_round,
+                    temperature=temperature,
+                    max_tokens=max_token,
+                    token_usage=self.last_prompt_token_count,
+                ),
+            })
             self.log_failure_event(
                 state=message,
                 action="exception",
@@ -1118,3 +1385,5 @@ Generate **one summarized sentence** about "function calls' responses" with nece
                 yield history
             else:
                 return None
+        finally:
+            self._end_optimization_session()

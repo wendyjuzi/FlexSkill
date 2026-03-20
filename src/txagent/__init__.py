@@ -50,3 +50,23 @@ except ImportError:
     FlexSkillController = None
     FlexSkillTxAgent = None
     RawFailureExperience = None
+
+try:
+    from .optimization import (
+        TxAgentOptimizationPlugin,
+        OptimizationEngine,
+        FailureCapture,
+        FailureStore,
+    )
+
+    __all__.extend([
+        "TxAgentOptimizationPlugin",
+        "OptimizationEngine",
+        "FailureCapture",
+        "FailureStore",
+    ])
+except ImportError:
+    TxAgentOptimizationPlugin = None
+    OptimizationEngine = None
+    FailureCapture = None
+    FailureStore = None
